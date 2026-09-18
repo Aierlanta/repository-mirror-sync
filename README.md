@@ -15,13 +15,13 @@ never the source repository or destination application's README.
 ## Schedule
 
 - Monday-Friday, UTC+8.
-- Every 10 minutes from 09:00 through 12:00, inclusive.
-- Every 10 minutes from 14:00 through 19:00, inclusive.
-- 50 scheduled runs per weekday; no scheduled runs during lunch or on weekends.
+- Every 30 minutes from 09:00 through 12:00, inclusive.
+- Every 30 minutes from 14:00 through 19:00, inclusive.
+- 18 scheduled runs per weekday; no scheduled runs during lunch or on weekends.
 - Manual runs: **Actions > Synchronize repositories > Run workflow**.
 
 GitHub schedules are best-effort. Runs may be delayed or dropped during load;
-this is not a guaranteed ten-minute replication SLA. Public scheduled workflows
+this is not a guaranteed thirty-minute replication SLA. Public scheduled workflows
 can be disabled after 60 days without repository activity. Successful status
 commits record real operational activity, but prolonged failures still require
 monitoring and manual attention.

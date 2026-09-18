@@ -3,7 +3,7 @@ name: Synchronize repositories
 on:
   schedule:
     # Monday-Friday, UTC+8: 09:00-12:00 and 14:00-19:00, inclusive.
-    - cron: '*/10 1-3,6-10 * * 1-5'
+    - cron: '*/30 1-3,6-10 * * 1-5'
     - cron: '0 4,11 * * 1-5'
   workflow_dispatch:
 
