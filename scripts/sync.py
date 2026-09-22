@@ -56,6 +56,84 @@ def references_match(source_references, target_references):
     )
 
 
+def is_ancestor(repository, ancestor, descendant, environment):
+    """True when `ancestor` is already part of `descendant`'s history (a plain fast-forward)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", repository, "merge-base", "--is-ancestor", ancestor, descendant],
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+        )
+    except (subprocess.SubprocessError, OSError):
+        raise SyncError("Ancestry check failed.") from None
+    # Exit 0: ancestor, exit 1: not an ancestor, anything else: missing object or Git failure.
+    if result.returncode not in (0, 1):
+        raise SyncError("Ancestry check failed.")
+    return result.returncode == 0
+
+
+def preserve_divergent_references(
+    source_directory, target_url, source_references, target_references, environment
+):
+    """Back up destination commits that the source no longer contains before overwriting them.
+
+    A destination branch/tag whose commit is not part of the source history means one of two
+    things: the source was rewound (reset + force push) or something pushed to the destination
+    directly. The destination commit is kept as a timestamped `mirror-backup/...` branch so the
+    forced push below never discards work; the destination-only backup branches are never synced.
+    """
+    divergent = [
+        reference
+        for reference, revision in source_references.items()
+        if reference in target_references and target_references[reference] != revision
+    ]
+    if not divergent:
+        return False
+    # Fetch the destination's current tips into a private namespace so their objects are local.
+    # --no-tags is essential: auto-followed destination tags would land in refs/tags and then be
+    # pushed back as if they came from the source.
+    fetched = {reference: "refs/mirror-target/" + reference[len("refs/") :] for reference in divergent}
+    run_git(
+        [
+            "-C",
+            source_directory,
+            "fetch",
+            "--no-tags",
+            "--",
+            target_url,
+            *(f"+{reference}:{local}" for reference, local in fetched.items()),
+        ],
+        environment,
+        "Destination fetch failed.",
+    )
+    stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")
+    backups = []
+    for reference, local in fetched.items():
+        # Peel annotated tags so the backup branch always points at a commit.
+        target_commit = run_git(
+            ["-C", source_directory, "rev-parse", "--verify", local + "^{commit}"],
+            environment,
+            "Destination commit lookup failed.",
+        ).strip()
+        if is_ancestor(source_directory, target_commit, source_references[reference], environment):
+            continue  # Plain fast-forward: nothing on the destination would be lost.
+        # refs/heads/x -> refs/heads/mirror-backup/heads/x/<stamp>; refs/tags/t -> .../tags/t/<stamp>
+        backups.append(f"{target_commit}:refs/heads/mirror-backup/{reference[len('refs/') :]}/{stamp}")
+    if not backups:
+        return False
+    # Backup names are new, so this is a normal (non-forced) push of destination-only branches.
+    run_git(
+        ["-C", source_directory, "push", "--", target_url, *backups],
+        environment,
+        "Backup push failed; nothing was overwritten.",
+    )
+    return True
+
+
 def sync_references(
     source_url, target_url, source_environment, target_environment, working_directory
 ):
@@ -90,24 +168,32 @@ def sync_references(
             "Fetched reference check failed.",
         )
     )
-    # Deliberately omit force, mirror and prune: reject conflicts rather than overwrite them.
+    preserved = preserve_divergent_references(
+        source_directory, target_url, source_references, target_references, target_environment
+    )
+    # The source is authoritative for every branch/tag name it has, so its references are forced
+    # onto the destination (following rewinds and replaced tags). No mirror/prune: references that
+    # exist only on the destination, including mirror-backup branches, are never deleted.
     run_git(
         [
             "-C",
             source_directory,
             "push",
+            "--",
             target_url,
-            "refs/heads/*:refs/heads/*",
-            "refs/tags/*:refs/tags/*",
+            "+refs/heads/*:refs/heads/*",
+            "+refs/tags/*:refs/tags/*",
         ],
         target_environment,
-        "Push failed. Check access or divergent branches/tags privately; no force push was attempted.",
+        "Push failed. Check destination access privately.",
     )
     target_references = read_remote_references(
         target_url, target_environment, "Destination verification failed."
     )
     if not references_match(source_references, target_references):
         raise SyncError("Reference verification failed; the success timestamp was not updated.")
+    if preserved:
+        print("Divergent destination commits were preserved as mirror-backup branches before overwrite.")
 
 
 def synchronize():
@@ -203,7 +289,7 @@ def main():
             "::error::Synchronization failed unexpectedly; private diagnostic output was suppressed."
         )
         return 1
-    print("All source references verified. No force pushes or deletions.")
+    print("All source references verified. Destination-only references untouched; no deletions.")
     return 0
 
 

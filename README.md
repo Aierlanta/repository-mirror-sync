@@ -43,10 +43,16 @@ separate job. It is not the credential used to write to the mirrored repository.
 
 - Compare branch/tag revisions first; fetch full history only when they differ.
 - Transfer original commits, branch names, and tags without rewriting history.
-- Never force-push, delete references, or push to the source.
+- The source is authoritative: every branch/tag name it has is forced onto the
+  destination, so source rewinds and replaced tags are followed instead of failing.
+- Never delete references or push to the source.
 - Preserve destination-only branches, such as independent agent work.
-- Divergent branches and replaced tags fail the run; some other references may
-  already have synchronized. Resolve conflicts privately before retrying.
+- Before overwriting a destination branch/tag whose commit is not in the source
+  history (source rewind, or a direct push to the destination), that commit is kept
+  on the destination as `mirror-backup/<heads|tags>/<name>/<timestamp>`. Backup
+  branches are destination-only, never synced, and must be deleted manually.
+- Direct pushes to the destination on a branch name the source also has are
+  overwritten on the next run; bring such work back through the source instead.
 - Do not execute code fetched from the source repository.
 - Do not publish source URLs, usernames, branch names, commit IDs, reference
   counts, raw Git output, private code, artifacts, or caches in this controller.
