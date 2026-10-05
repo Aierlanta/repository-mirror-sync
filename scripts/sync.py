@@ -2,33 +2,138 @@
 
 import base64
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+# Transient network failures are retried with growing delays; the counts below are the
+# number of *additional* attempts after the first one.
+REFERENCE_RETRY_DELAYS = (10, 30)  # branch/tag queries: short, idempotent, safe to repeat
+REFERENCE_TIMEOUT = 90  # a healthy ls-remote finishes in seconds; anything longer is a stall
+CLONE_RETRY_DELAYS = (30,)  # a bare clone into a fresh directory can be repeated once
+CLONE_TIMEOUT = 600
+# Abort (and retry) transfers that stall below 1 KiB/s for a full minute instead of hanging
+# until the subprocess timeout; curl reports this as "Operation too slow".
+LOW_SPEED_LIMIT_BYTES_PER_SECOND = "1024"
+LOW_SPEED_TIME_SECONDS = "60"
 
 
 class SyncError(Exception):
     """A public-safe error that intentionally omits Git command output."""
 
 
-def run_git(arguments, environment, failure_message):
-    try:
-        result = subprocess.run(
-            ["git", *arguments],
-            env=environment,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=True,
-            timeout=600,
-        )
-    except (subprocess.SubprocessError, OSError):
-        raise SyncError(failure_message) from None
-    return result.stdout
+def classify_git_failure(error):
+    """Inspect stderr privately; return only a fixed category and whether it is transient."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "timeout", True
+    if isinstance(error, OSError):
+        return "local-execution", False
+    if not isinstance(error, subprocess.CalledProcessError):
+        return "git", False
+    diagnostic = error.stderr or ""
+    if isinstance(diagnostic, bytes):
+        diagnostic = diagnostic.decode("utf-8", errors="replace")
+    diagnostic = diagnostic.lower()
+    # Permanent errors take precedence; never retry a credential or trust failure.
+    if any(marker in diagnostic for marker in (
+        "authentication failed", "permission denied", "access denied",
+        "could not read username", "could not read password",
+    )):
+        return "authentication-or-permission", False
+    if any(marker in diagnostic for marker in (
+        "ssl certificate problem", "certificate verification failed",
+        "certificate verify failed", "certificate is not trusted",
+        "certificate has expired", "error in the certificate",
+        "server certificate verification failed", "host key verification failed",
+        "remote host identification has changed",
+    )):
+        return "certificate-or-host-key", False
+    if "repository not found" in diagnostic:
+        return "repository-unavailable", False
+    status = re.search(r"the requested url returned error: (\d{3})\b", diagnostic)
+    if status:
+        code = int(status.group(1))
+        if code in (401, 403):
+            return "authentication-or-permission", False
+        if code == 404:
+            return "repository-unavailable", False
+        if code in (408, 429, 500, 502, 503, 504):
+            return "temporary-http", True
+        return "http", False
+    if any(marker in diagnostic for marker in (
+        "could not resolve host", "could not resolve proxy",
+        "temporary failure in name resolution",
+    )):
+        return "dns", True
+    if "timed out" in diagnostic or "timeout was reached" in diagnostic:
+        return "timeout", True
+    if "operation too slow" in diagnostic:
+        return "timeout", True
+    if any(marker in diagnostic for marker in (
+        "failed to connect", "connection refused", "connection reset",
+        "connection closed", "network is unreachable", "empty reply from server",
+        "tls connection was non-properly terminated", "gnutls_recv error (-110)",
+        "ssl_error_syscall",
+        "http/2 stream", "http2 framing layer",
+    )):
+        return "connection", True
+    # Unrecognized errors fail closed rather than being hidden by blanket retries.
+    return "git", False
+
+
+def run_git(
+    arguments,
+    environment,
+    failure_message,
+    *,
+    retry_delays=(),
+    timeout=600,
+    before_retry=None,
+):
+    """Run one Git command and return its stdout.
+
+    Retries are opt-in per call site: by default a command runs exactly once, so pushes and
+    other state-changing operations are never repeated implicitly. `retry_delays` lists the
+    sleep before each additional attempt; `before_retry` (if given) restores a clean starting
+    state between attempts, e.g. deleting a partially written clone directory.
+    """
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            result = subprocess.run(
+                ["git", *arguments],
+                # Classification relies on Git's standard English error messages.
+                env={**environment, "LC_ALL": "C", "LANG": "C"},
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+                timeout=timeout,
+            )
+            return result.stdout
+        except (subprocess.SubprocessError, OSError) as error:
+            category, transient = classify_git_failure(error)
+            if not transient or attempt == len(retry_delays):
+                raise SyncError(
+                    f"{failure_message} Category: {category}; attempts: {attempt + 1}."
+                ) from None
+            delay = retry_delays[attempt]
+            # No raw stderr, command, URL or exception text may cross this privacy boundary.
+            print(
+                f"::warning::{failure_message} Category: {category}; "
+                f"retry {attempt + 1}/{len(retry_delays)} in {delay}s.",
+                flush=True,
+            )
+            if before_retry is not None:
+                before_retry()
+            time.sleep(delay)
 
 
 def parse_references(output):
@@ -44,6 +149,8 @@ def read_remote_references(repository_url, environment, failure_message):
             ["ls-remote", "--refs", repository_url, "refs/heads/*", "refs/tags/*"],
             environment,
             failure_message,
+            retry_delays=REFERENCE_RETRY_DELAYS,
+            timeout=REFERENCE_TIMEOUT,
         )
     )
 
@@ -153,6 +260,11 @@ def sync_references(
         ["clone", "--bare", "--", source_url, source_directory],
         source_environment,
         "Source fetch failed.",
+        retry_delays=CLONE_RETRY_DELAYS,
+        timeout=CLONE_TIMEOUT,
+        # A failed clone may leave a partial directory behind; Git refuses to clone into a
+        # non-empty directory, so it is removed before the next attempt starts from scratch.
+        before_retry=lambda: shutil.rmtree(source_directory, ignore_errors=True),
     )
     source_references = parse_references(
         run_git(
@@ -230,9 +342,14 @@ def synchronize():
     print("::add-mask::" + authorization, flush=True)
     source_environment.update(
         {
-            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_COUNT": "4",
             "GIT_CONFIG_KEY_1": f"http.https://{source_address.netloc}/.extraheader",
             "GIT_CONFIG_VALUE_1": "Authorization: Basic " + authorization,
+            # Stalled HTTPS transfers fail fast (and become retryable) instead of hanging.
+            "GIT_CONFIG_KEY_2": "http.lowSpeedLimit",
+            "GIT_CONFIG_VALUE_2": LOW_SPEED_LIMIT_BYTES_PER_SECOND,
+            "GIT_CONFIG_KEY_3": "http.lowSpeedTime",
+            "GIT_CONFIG_VALUE_3": LOW_SPEED_TIME_SECONDS,
         }
     )
 

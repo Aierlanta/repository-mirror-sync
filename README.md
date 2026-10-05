@@ -42,6 +42,16 @@ separate job. It is not the credential used to write to the mirrored repository.
 ## Behavior and privacy
 
 - Compare branch/tag revisions first; fetch full history only when they differ.
+- Retry only transient failures (DNS, connection interruption, timeout, stalled
+  transfer, or temporary HTTP errors). Branch/tag queries get at most 3 attempts
+  with a 90-second limit per attempt and delays of 10 then 30 seconds; this applies
+  to both endpoints and destination verification. The source clone gets at most
+  2 attempts (30-second delay) and always restarts from an empty directory.
+  Destination fetch and every push run exactly once and are never repeated.
+- HTTPS transfers from the source abort when they stay below 1 KiB/s for 60 seconds,
+  so a stalled connection fails fast and is retried instead of hanging.
+- Authentication, permission, certificate/host-key and unrecognized failures stop
+  immediately. Exhausted retries still fail the job and never update the success time.
 - Transfer original commits, branch names, and tags without rewriting history.
 - The source is authoritative: every branch/tag name it has is forced onto the
   destination, so source rewinds and replaced tags are followed instead of failing.
@@ -56,7 +66,8 @@ separate job. It is not the credential used to write to the mirrored repository.
 - Do not execute code fetched from the source repository.
 - Do not publish source URLs, usernames, branch names, commit IDs, reference
   counts, raw Git output, private code, artifacts, or caches in this controller.
-- Expose only generic success/failure messages and successful synchronization time.
+- Expose only generic success/failure messages, fixed error categories, retry
+  counts/delays and successful synchronization time; never print raw Git errors.
 - Keep diagnostic investigation private; masking alone is not the privacy boundary.
 - Pin third-party actions and the destination host's published SSH key.
 - Only scheduled and manually authorized runs are supported; no PR-triggered jobs.
